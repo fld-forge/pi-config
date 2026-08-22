@@ -23,6 +23,20 @@ DOCS = ("README.md", "CONTRIBUTING.md", "AGENTS.md")
 GITLEAKS_REPO = "https://github.com/gitleaks/gitleaks"
 INSTALL_HOOK_TYPES = ("pre-commit", "pre-merge-commit")
 
+# Fragments of the release-assets commands that populate or prune dist/. Each
+# has to run before the attestation freezes its subjects; see
+# test_release_asset_step_order. The tuple is maintained by hand: recognizing
+# "any step that writes to dist/" would mean parsing shell, so a producer added
+# to the workflow and not added here is not covered. Adding one is part of
+# adding the step.
+DIST_PRODUCERS = (
+    "uv build",
+    "rm -f dist/.gitignore",
+    "sbom.cdx.json",
+    "sbom.spdx.json",
+    "SHA256SUMS",
+)
+
 # The hook types declared in a comment instead of in the mapping. A review
 # proved the earlier text search accepted this, though it installs nothing.
 COMMENTED_INSTALL_TYPES_CONFIG = """
@@ -617,6 +631,115 @@ def test_semgrep_command_documented() -> None:
     assert quoted, "NORTHSTAR.md: quoted semgrep command not found"
     assert f"- run: {quoted.group(1)}" in _text(".github/workflows/ci.yml"), (
         f"NORTHSTAR.md quotes {quoted.group(1)!r}; ci.yml runs a different semgrep command"
+    )
+
+
+def _asset_step_mappings() -> list[dict[str, object]]:
+    """The release-assets steps as parsed, before they are flattened."""
+    workflow = yaml.safe_load(_text(".github/workflows/release-please.yml"))
+    steps: list[dict[str, object]] = workflow["jobs"]["release-assets"]["steps"]
+    return steps
+
+
+def _asset_steps() -> list[str]:
+    """The release-assets steps, each flattened to its action and command.
+
+    `name:` is deliberately left out and comments never survive the parse, so
+    a step is located by what it runs rather than by how it is described. That
+    matters here: the bundle-copy step carries a long comment naming both
+    SHA256SUMS and subject-path, and a text search would find those tokens in
+    prose and lose the uniqueness the order check depends on. `with:` is left
+    out too, which is why the attestation's `subject-path` is asserted against
+    the mappings instead.
+    """
+    return [f"{step.get('uses', '')} {step.get('run', '')}" for step in _asset_step_mappings()]
+
+
+def _only_step(bodies: list[str], fragment: str, role: str) -> int:
+    """Index of the one release-assets step whose command carries `fragment`.
+
+    Uniqueness is asserted, not assumed: taking the first of several matches
+    would compare an arbitrary index, and the order assertion below would then
+    pass or fail for a reason unrelated to the order it claims to check.
+    """
+    hits = [index for index, body in enumerate(bodies) if fragment in body]
+    assert len(hits) == 1, (
+        f"release-please.yml: expected exactly one release-assets step whose "
+        f"command carries {fragment!r} ({role}), found {len(hits)} at {hits}; "
+        f"the step-order gate cannot tell which one it must compare"
+    )
+    return hits[0]
+
+
+def test_release_asset_step_order() -> None:
+    """dist/ is complete before the attestation freezes what it signs.
+
+    The attestation resolves `subject-path: dist/*` once, when it runs. Every
+    step that populates or prunes dist/ therefore has to precede it: a file
+    added afterwards ships unattested, and one left behind that should have
+    gone is signed as a stray subject. That is the v0.5.2/v0.6.0 incident,
+    where the dist/.gitignore uv build creates became a subject of the
+    release. The bundle copy is the mirror case and has to follow the
+    attestation, or it would end up attesting itself.
+
+    SHA256SUMS carries a second, stricter constraint: it has to be written
+    after every other producer, not merely before the attestation. Written
+    earlier it checksums whatever dist/ held at that moment, and the files
+    written after it are attested but absent from it -- `sha256sum --check`
+    then reports success over a subset, which reads exactly like a full pass.
+
+    Both constraints are read against DIST_PRODUCERS, a hand-maintained tuple:
+    a producer added to the workflow but not to it escapes this gate.
+
+    Reordering these steps is silent: the workflow states the constraint in a
+    comment, the assets look plausible either way, and the damage only shows
+    up in a published release that can no longer be changed.
+    """
+    bodies = _asset_steps()
+    attest = _only_step(bodies, "attest-build-provenance", "attests dist/")
+    for fragment in DIST_PRODUCERS:
+        producer = _only_step(bodies, fragment, "populates or prunes dist/")
+        assert producer < attest, (
+            f"release-please.yml: the release-assets step running {fragment!r} "
+            f"is at index {producer}, after the attestation at index {attest}; "
+            f"it must run before, or what it writes to dist/ ships unattested "
+            f"and what it deletes is attested as a stray subject"
+        )
+    inputs = _asset_step_mappings()[attest].get("with")
+    assert isinstance(inputs, dict), (
+        f"release-please.yml: the attestation step at index {attest} declares "
+        f"no `with:` mapping, so it attests nothing this gate can read"
+    )
+    subject = inputs.get("subject-path")
+    assert subject == "dist/*", (
+        f"release-please.yml: the attestation attests {subject!r}, not "
+        f"'dist/*'; the step-order gate above only proves that dist/ is "
+        f"complete when the attestation runs, which is worth nothing if the "
+        f"attestation no longer covers all of dist/"
+    )
+    checksums = _only_step(bodies, "SHA256SUMS", "checksums dist/")
+    late = sorted(
+        fragment
+        for fragment in DIST_PRODUCERS
+        if fragment != "SHA256SUMS"
+        and _only_step(bodies, fragment, "populates or prunes dist/") > checksums
+    )
+    assert not late, (
+        f"release-please.yml: the release-assets step writing SHA256SUMS is at "
+        f"index {checksums}, before {late}; SHA256SUMS must be written after "
+        f"every other producer or it checksums an incomplete dist/, and the "
+        f"assets written after it ship attested but unchecksummed while "
+        f"`sha256sum --check` still reports success over the subset it covers"
+    )
+    copy = _only_step(bodies, "attestation.intoto.jsonl", "ships the bundle")
+    upload = _only_step(bodies, "gh release upload", "uploads the assets")
+    publish = _only_step(bodies, "--draft=false", "publishes the release")
+    assert attest < copy < upload < publish, (
+        f"release-please.yml: release-assets must attest (index {attest}), then "
+        f"copy the bundle ({copy}), then upload ({upload}), then publish "
+        f"({publish}). Copying before the attestation makes the bundle attest "
+        f"itself; publishing before the upload locks an immutable release with "
+        f"assets missing"
     )
 
 
